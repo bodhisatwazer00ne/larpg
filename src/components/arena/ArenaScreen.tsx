@@ -27,9 +27,43 @@ interface ArenaScreenProps {
   onDefeat: (rival: Rival) => void;
   onRun?: (rival: Rival) => void;
   onUseItemInBattle: (inventoryItemId: string) => void;
+  initialBattleId?: string | null;
+  initialBattleRival?: Rival | null;
+  onClearInitialBattle?: () => void;
 }
 
 type ArenaFilter = 'ONLINE_ONLY' | 'ALL' | 'SAME_LEVEL' | 'CHALLENGERS';
+
+// Convert a DuelChallenge to a combat Rival
+export const convertChallengeToRival = (chal: DuelChallenge, userLevel: number = 1): Rival => {
+  return {
+    id: chal.challengerId,
+    username: chal.challengerName,
+    title: chal.challengerTitle || 'Adventurer',
+    avatarId: chal.challengerAvatarId,
+    level: chal.challengerLevel,
+    hp: chal.challengerStats?.maxHp || 40,
+    maxHp: chal.challengerStats?.maxHp || 40,
+    stamina: chal.challengerStats?.maxStamina || 45,
+    maxStamina: chal.challengerStats?.maxStamina || 45,
+    attributes: chal.challengerStats?.attributes || {
+      str: chal.challengerLevel * 2,
+      int: chal.challengerLevel * 2,
+      end: chal.challengerLevel * 2,
+      res: chal.challengerLevel * 2,
+      dis: chal.challengerLevel * 2,
+      wil: chal.challengerLevel * 2,
+    },
+    equipmentName: 'Adventurer Gear',
+    bio: 'Real-world player duel challenger',
+    difficulty: chal.challengerLevel > userLevel ? 'VETERAN' : 'ADEPT',
+    winRewardXp: 60 + chal.challengerLevel * 35,
+    winRewardGold: 0,
+    specialSkillName: 'Real-World Focus Strike',
+    acceptanceQuote: `I have issued you a challenge! Let's see your discipline in action!`,
+    status: 'ONLINE',
+  };
+};
 
 export const ArenaScreen: React.FC<ArenaScreenProps> = ({
   user,
@@ -40,10 +74,15 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
   onDefeat,
   onRun,
   onUseItemInBattle,
+  initialBattleId = null,
+  initialBattleRival = null,
+  onClearInitialBattle,
 }) => {
   const [realTrainers, setRealTrainers] = useState<PublicTrainer[]>([]);
   const [incomingChallenges, setIncomingChallenges] = useState<DuelChallenge[]>([]);
+  const [outgoingChallenges, setOutgoingChallenges] = useState<DuelChallenge[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [isAcceptingId, setIsAcceptingId] = useState<string | null>(null);
 
   // Active battle rival and session ID if currently in simultaneous combat
   const [activeBattleRival, setActiveBattleRival] = useState<Rival | null>(null);
@@ -60,6 +99,18 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
 
   // Filter for matching trainers
   const [filter, setFilter] = useState<ArenaFilter>('ONLINE_ONLY');
+
+  // Effect to immediately launch combat if entered with an initial battle
+  useEffect(() => {
+    if (initialBattleId && initialBattleRival) {
+      processedBattlesRef.current.add(initialBattleId);
+      setActiveBattleId(initialBattleId);
+      setActiveBattleRival(initialBattleRival);
+      if (onClearInitialBattle) {
+        onClearInitialBattle();
+      }
+    }
+  }, [initialBattleId, initialBattleRival, onClearInitialBattle]);
 
   // Ensure current user's presence is marked as online when entering the arena
   useEffect(() => {
@@ -117,6 +168,7 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
   // Subscribe to outgoing challenges (when accepted by rival, automatically enter live battle)
   useEffect(() => {
     const unsubOutgoing = subscribeToOutgoingChallenges(user.id, (outgoingList) => {
+      setOutgoingChallenges(outgoingList);
       const accepted = outgoingList.find(
         (c) => c.status === 'ACCEPTED' && c.battleId && !processedBattlesRef.current.has(c.battleId)
       );
@@ -188,37 +240,6 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
     };
   };
 
-  // Convert a DuelChallenge to a combat Rival
-  const convertChallengeToRival = (chal: DuelChallenge): Rival => {
-    return {
-      id: chal.challengerId,
-      username: chal.challengerName,
-      title: chal.challengerTitle || 'Adventurer',
-      avatarId: chal.challengerAvatarId,
-      level: chal.challengerLevel,
-      hp: chal.challengerStats?.maxHp || 40,
-      maxHp: chal.challengerStats?.maxHp || 40,
-      stamina: chal.challengerStats?.maxStamina || 45,
-      maxStamina: chal.challengerStats?.maxStamina || 45,
-      attributes: chal.challengerStats?.attributes || {
-        str: chal.challengerLevel * 2,
-        int: chal.challengerLevel * 2,
-        end: chal.challengerLevel * 2,
-        res: chal.challengerLevel * 2,
-        dis: chal.challengerLevel * 2,
-        wil: chal.challengerLevel * 2,
-      },
-      equipmentName: 'Adventurer Gear',
-      bio: 'Real-world player duel challenger',
-      difficulty: chal.challengerLevel > user.level ? 'VETERAN' : 'ADEPT',
-      winRewardXp: 60 + chal.challengerLevel * 35,
-      winRewardGold: 0,
-      specialSkillName: 'Real-World Focus Strike',
-      acceptanceQuote: `I have issued you a challenge! Let's see your discipline in action!`,
-      status: 'ONLINE',
-    };
-  };
-
   // Filtered real-world trainers list
   const filteredTrainers = useMemo(() => {
     return realTrainers.filter((trainer) => {
@@ -256,12 +277,14 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
     }
   };
 
-  // Accept incoming challenge and launch simultaneous battle (ONLY when both are online)
+  // Accept incoming challenge and launch simultaneous battle
   const handleAcceptIncomingChallenge = async (chal: DuelChallenge) => {
+    if (isAcceptingId) return;
+    setIsAcceptingId(chal.id);
     chiptune.playHit();
     try {
       const battleId = await acceptDuelChallengeAndStartBattle(chal, user);
-      const rival = convertChallengeToRival(chal);
+      const rival = convertChallengeToRival(chal, user.level);
       processedBattlesRef.current.add(battleId);
       setActiveBattleId(battleId);
       setActiveBattleRival(rival);
@@ -270,6 +293,8 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
       setDispatchedChallengeMsg(
         err?.message || `Could not start duel with Trainer ${chal.challengerName}. Please try again.`
       );
+    } finally {
+      setIsAcceptingId(null);
     }
   };
 
@@ -278,7 +303,7 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
     chiptune.playCursor();
     try {
       await respondToDuelChallenge(chal.id, false);
-      await deleteDuelChallenge(chal.id);
+      setDispatchedChallengeMsg(`Declined duel challenge from Trainer ${chal.challengerName}.`);
     } catch (err) {
       console.warn('Error declining challenge:', err);
     }
@@ -408,6 +433,72 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
         </div>
       )}
 
+      {/* OUTGOING CHALLENGES STATUS */}
+      {outgoingChallenges.map((out) => {
+        if (out.status === 'PENDING') {
+          return (
+            <div
+              key={out.id}
+              className="bg-[#eff6ff] border-4 border-[#3b82f6] p-4 shadow-[4px_4px_0px_#120e1d] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3"
+            >
+              <div className="flex items-center gap-2.5">
+                <span className="w-3 h-3 rounded-full bg-[#3b82f6] animate-ping shrink-0" />
+                <div>
+                  <div className="font-pixel text-xs text-[#1e40af] font-bold">
+                    ⏳ CHALLENGE SENT TO {out.targetName.toUpperCase()}
+                  </div>
+                  <div className="font-silkscreen text-[11px] text-[#1e3a8a] mt-0.5">
+                    Waiting for Trainer <span className="font-bold">{out.targetName}</span> to accept or decline your duel challenge...
+                  </div>
+                </div>
+              </div>
+              <PixelButton
+                variant="dark"
+                size="sm"
+                onClick={async () => {
+                  chiptune.playCursor();
+                  await deleteDuelChallenge(out.id);
+                  setDispatchedChallengeMsg(`Cancelled challenge to ${out.targetName}.`);
+                }}
+              >
+                ✕ CANCEL CHALLENGE
+              </PixelButton>
+            </div>
+          );
+        }
+        if (out.status === 'DECLINED') {
+          return (
+            <div
+              key={out.id}
+              className="bg-[#fef2f2] border-4 border-[#ef4444] p-4 shadow-[4px_4px_0px_#120e1d] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3"
+            >
+              <div className="flex items-center gap-2.5">
+                <span className="font-pixel text-sm text-[#b91c1c]">⚠️</span>
+                <div>
+                  <div className="font-pixel text-xs text-[#991b1b] font-bold">
+                    CHALLENGE DECLINED
+                  </div>
+                  <div className="font-silkscreen text-[11px] text-[#7f1d1d] mt-0.5">
+                    Trainer <span className="font-bold">{out.targetName}</span> declined your duel challenge request.
+                  </div>
+                </div>
+              </div>
+              <PixelButton
+                variant="dark"
+                size="sm"
+                onClick={async () => {
+                  chiptune.playCursor();
+                  await deleteDuelChallenge(out.id);
+                }}
+              >
+                DISMISS
+              </PixelButton>
+            </div>
+          );
+        }
+        return null;
+      })}
+
       {/* REAL-TIME INCOMING CHALLENGES FROM REAL PLAYERS */}
       {incomingChallenges.map((chal) => {
         const challengerTrainer = realTrainers.find((t) => t.userId === chal.challengerId);
@@ -431,7 +522,7 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
                   }`}
                 >
                   {isChallengerOnline && <span className="w-2 h-2 rounded-full bg-[#fef08a] animate-ping" />}
-                  {isChallengerOnline ? '⚔ REAL-TIME DUEL CHALLENGE RECEIVED!' : '⚠️ CHALLENGE RECEIVED (CHALLENGER OFFLINE)'}
+                  {isChallengerOnline ? '⚔ REAL-TIME DUEL CHALLENGE RECEIVED!' : '⚔ REAL-TIME DUEL CHALLENGE RECEIVED!'}
                 </span>
                 <span className="font-pixel text-[10px] sm:text-xs text-[#854d0e] bg-[#fef08a] px-2 py-0.5 border border-[#ca8a04]">
                   LV. {chal.challengerLevel} REAL PLAYER
@@ -444,7 +535,7 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
                 </span>
               ) : (
                 <span className="font-pixel text-[9px] bg-[#e5e7eb] text-[#4b5563] px-2 py-0.5 border border-[#9ca3af]">
-                  ✕ CURRENTLY OFFLINE
+                  WAITING IN ARENA
                 </span>
               )}
             </div>
@@ -470,38 +561,27 @@ export const ArenaScreen: React.FC<ArenaScreenProps> = ({
                   </div>
 
                   <div className="bg-[#ede3ce] border border-[#d4c5a9] p-2 sm:p-2.5 mt-2 font-silkscreen text-xs text-[#453823] leading-relaxed italic">
-                    {isChallengerOnline
-                      ? '"I challenge you to a duel of discipline and habit power!"'
-                      : 'Challenger is currently offline. Both players must be online to play.'}
+                    &ldquo;I challenge you to a duel of discipline and habit power! Step into the arena!&rdquo;
                   </div>
                 </div>
               </div>
 
-              {/* Actions */}
+              {/* Actions - ALWAYS ENABLED */}
               <div className="flex items-center gap-2.5 w-full md:w-auto shrink-0 pt-2 md:pt-0">
-                {isChallengerOnline ? (
-                  <PixelButton
-                    variant="green"
-                    size="md"
-                    className="flex-1 md:flex-initial"
-                    onClick={() => handleAcceptIncomingChallenge(chal)}
-                  >
-                    ⚔ ACCEPT DUEL & PLAY ▶
-                  </PixelButton>
-                ) : (
-                  <PixelButton
-                    variant="stone"
-                    size="md"
-                    disabled={true}
-                    className="flex-1 md:flex-initial opacity-60 cursor-not-allowed"
-                  >
-                    ✕ OFFLINE (CANNOT PLAY)
-                  </PixelButton>
-                )}
+                <PixelButton
+                  variant="green"
+                  size="md"
+                  className="flex-1 md:flex-initial"
+                  disabled={isAcceptingId === chal.id}
+                  onClick={() => handleAcceptIncomingChallenge(chal)}
+                >
+                  {isAcceptingId === chal.id ? '⚔ COMMENCING...' : '⚔ ACCEPT DUEL & PLAY ▶'}
+                </PixelButton>
                 <PixelButton
                   variant="dark"
                   size="md"
                   className="flex-1 md:flex-initial"
+                  disabled={isAcceptingId === chal.id}
                   onClick={() => handleDeclineIncomingChallenge(chal)}
                 >
                   ✕ DECLINE

@@ -22,6 +22,7 @@ export const AuthHomePage: React.FC = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [trainerName, setTrainerName] = useState('');
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [domainCopied, setDomainCopied] = useState(false);
@@ -63,9 +64,10 @@ export const AuthHomePage: React.FC = () => {
     setLoading(true);
     try {
       if (mode === 'REGISTER') {
-        await signUpWithEmail(email, password, '');
+        const cleanTrainerName = trainerName.trim() || email.split('@')[0].trim();
+        await signUpWithEmail(email, password, cleanTrainerName);
         chiptune.playLevelUp();
-        setFeedback('Account ready! Welcome, Trainer.');
+        setFeedback(`Account ready! Welcome, ${cleanTrainerName}.`);
       } else if (mode === 'RESET') {
         await resetPassword(email, password);
         chiptune.playLevelUp();
@@ -395,6 +397,22 @@ export const AuthHomePage: React.FC = () => {
                     placeholder="••••••••"
                     required
                     minLength={6}
+                    className="w-full bg-[#fcf8f0] border-2 border-[#120e1d] px-3 py-2 font-silkscreen text-xs text-[#181425] focus:outline-none focus:border-[#e43b44]"
+                  />
+                </div>
+              )}
+
+              {mode === 'REGISTER' && (
+                <div>
+                  <label className="block font-pixel text-[10px] text-[#433726] mb-1">
+                    TRAINER NAME (OPTIONAL):
+                  </label>
+                  <input
+                    type="text"
+                    value={trainerName}
+                    onChange={(e) => setTrainerName(e.target.value)}
+                    placeholder="e.g. Red, Ash, Bolia (defaults to email)"
+                    maxLength={20}
                     className="w-full bg-[#fcf8f0] border-2 border-[#120e1d] px-3 py-2 font-silkscreen text-xs text-[#181425] focus:outline-none focus:border-[#e43b44]"
                   />
                 </div>

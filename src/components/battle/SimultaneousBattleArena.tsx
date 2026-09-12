@@ -273,6 +273,10 @@ export const SimultaneousBattleArena: React.FC<SimultaneousBattleArenaProps> = (
           if (!hasMyAction && session) {
             submitBattleAction(battleId, user.id, 'DEFEND', session.round);
           }
+          // If rival hasn't submitted and timer expired, auto-submit action for rival so round can resolve
+          if (!hasRivalAction && session && rivalState?.id) {
+            submitBattleAction(battleId, rivalState.id, 'DEFEND', session.round);
+          }
           return 15;
         }
         return prev - 1;
@@ -280,7 +284,7 @@ export const SimultaneousBattleArena: React.FC<SimultaneousBattleArenaProps> = (
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [session, hasMyAction, hasRivalAction, battleId, user.id]);
+  }, [session, hasMyAction, hasRivalAction, battleId, user.id, rivalState?.id]);
 
   // Handle action submission
   const handleActionClick = async (action: BattleActionType) => {

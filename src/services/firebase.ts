@@ -29,6 +29,7 @@ import {
   updateDoc 
 } from 'firebase/firestore';
 import { updateProfile } from 'firebase/auth';
+import { createInitialState } from './storage';
 
 // Initialize Firebase with environment variable overrides if provided (e.g., in Render, Vercel, or CI/CD)
 const activeFirebaseConfig = {
@@ -195,13 +196,15 @@ export async function claimUniqueUsername(
     return { success: false, error: 'Username can only contain letters, numbers, hyphens, and underscores.' };
   }
 
-  const currentUid = auth.currentUser?.uid || userId;
+  const cleanEmail = (auth.currentUser?.email || '').toLowerCase().trim();
+  const canonicalId = cleanEmail ? emailToSafeAccountId(cleanEmail) : '';
+  const currentUid = userId || canonicalId || auth.currentUser?.uid || '';
   try {
     try {
       const existing = await getDoc(doc(db, 'usernames', cleanLower));
       if (existing.exists()) {
         const data = existing.data();
-        if (data.userId !== currentUid) {
+        if (data.userId !== currentUid && data.userId !== canonicalId && data.userId !== auth.currentUser?.uid) {
           return { success: false, error: 'This username is already taken by another account.' };
         }
       }
@@ -212,7 +215,7 @@ export async function claimUniqueUsername(
     // Reserve username document in Firestore
     try {
       await setDoc(doc(db, 'usernames', cleanLower), sanitizeForFirestore({
-        userId: currentUid,
+        userId: canonicalId || currentUid,
         username: clean,
         createdAt: new Date().toISOString(),
       }));
@@ -220,26 +223,32 @@ export async function claimUniqueUsername(
       console.warn('Firestore username reservation warning:', setErr);
     }
 
-    // Update user game profile document
-    try {
-      await setDoc(doc(db, 'users', currentUid), sanitizeForFirestore({
-        userId: currentUid,
-        hasClaimedUsername: true,
-        user: {
-          username: clean,
-        },
-        updatedAt: new Date().toISOString(),
-      }), { merge: true });
-    } catch (userErr) {
-      console.warn('Firestore user update warning:', userErr);
+    // Update user game profile document across all valid IDs
+    const targets = Array.from(new Set([currentUid, canonicalId, auth.currentUser?.uid].filter(Boolean))) as string[];
+    for (const target of targets) {
+      try {
+        await setDoc(doc(db, 'users', target), sanitizeForFirestore({
+          userId: target,
+          hasClaimedUsername: true,
+          user: {
+            username: clean,
+          },
+          updatedAt: new Date().toISOString(),
+        }), { merge: true });
+      } catch (userErr) {
+        console.warn('Firestore user update warning:', userErr);
+      }
     }
 
     // Update local cache
     try {
-      localStorage.setItem(`liferpg_username_claimed_${currentUid}`, 'true');
+      for (const target of targets) {
+        localStorage.setItem(`liferpg_username_claimed_${target}`, 'true');
+        localStorage.setItem(`liferpg_trainer_name_${target}`, clean);
+      }
       const localClaimed = localStorage.getItem('liferpg_claimed_usernames_v1');
       const parsed = localClaimed ? JSON.parse(localClaimed) : {};
-      parsed[cleanLower] = currentUid;
+      parsed[cleanLower] = canonicalId || currentUid;
       localStorage.setItem('liferpg_claimed_usernames_v1', JSON.stringify(parsed));
     } catch (storageErr) {
       console.warn('Local storage cache warning:', storageErr);
@@ -400,22 +409,26 @@ export async function checkUserHasClaimedUsername(userId: string, email?: string
   }
 }
 
-// Check if trainer is considered live and online (active in past 3 minutes, clock-skew tolerant)
+// Check if trainer is considered live and online (clock-skew and background-tab tolerant)
 export function isTrainerOnline(trainer?: PublicTrainer | null): boolean {
   if (!trainer) return false;
+  // If explicitly flagged offline, check if active in last 30s
+  if (trainer.isOnline === false) {
+    if (!trainer.lastActive) return false;
+    const lastActiveTime = new Date(trainer.lastActive).getTime();
+    if (isNaN(lastActiveTime)) return false;
+    const diff = Math.abs(Date.now() - lastActiveTime);
+    return diff < 30000;
+  }
+  // If isOnline is true or unset, check lastActive with broad tolerance (up to 15 mins)
   if (!trainer.lastActive) {
-    return Boolean(trainer.isOnline);
+    return true;
   }
   const lastActiveTime = new Date(trainer.lastActive).getTime();
-  if (isNaN(lastActiveTime)) return Boolean(trainer.isOnline);
+  if (isNaN(lastActiveTime)) return true;
   const diff = Date.now() - lastActiveTime;
-  // Tolerant to clock skew (-30s future) and relaxed threshold up to 3 minutes (180,000ms)
-  const isHeartbeatRecent = diff >= -30000 && diff < 180000;
-  if (trainer.isOnline === false) {
-    // If explicitly marked offline, only consider online if active in last 15s (recovery)
-    return isHeartbeatRecent && diff < 15000;
-  }
-  return isHeartbeatRecent;
+  // Background browser tabs throttle timers, and user devices may have clock skew (-10m to +15m)
+  return diff > -600000 && diff < 900000;
 }
 
 // Directly check if a trainer is currently online by querying Firestore document
@@ -423,12 +436,12 @@ export async function checkTrainerIsOnline(userId: string): Promise<boolean> {
   if (!userId) return false;
   try {
     const snap = await getDoc(doc(db, 'publicTrainers', userId));
-    if (!snap.exists()) return false;
+    if (!snap.exists()) return true;
     const data = snap.data() as PublicTrainer;
     return isTrainerOnline(data);
   } catch (err) {
     console.warn('Check trainer online error:', err);
-    return false;
+    return true;
   }
 }
 
@@ -563,21 +576,18 @@ export function subscribeToPublicTrainers(
   );
 }
 
-// Send a duel challenge to a real player (ONLY when both are online)
+// Send a duel challenge to a real player
 export async function sendDuelChallenge(
   targetTrainer: PublicTrainer,
   challenger: User
 ): Promise<string> {
-  // 1. Verify target trainer is currently online in Firestore
-  const isTargetOnline = await checkTrainerIsOnline(targetTrainer.userId);
-  if (!isTargetOnline) {
-    throw new Error(`Trainer ${targetTrainer.username} is currently offline. Both trainers must be online to challenge and play.`);
-  }
+  // 1. Ensure challenger presence is marked online
+  await updateTrainerPresence(challenger.id, true);
 
-  // 2. Ensure challenger presence is marked online
-  const isChallengerOnline = await checkTrainerIsOnline(challenger.id);
-  if (!isChallengerOnline) {
-    await updateTrainerPresence(challenger.id, true);
+  // 2. Verify target trainer presence (tolerant to clock skew and sync delay)
+  const isTargetOnline = isTrainerOnline(targetTrainer);
+  if (!isTargetOnline && targetTrainer.isOnline === false) {
+    throw new Error(`Trainer ${targetTrainer.username} is currently offline. Both trainers must be online to challenge and play.`);
   }
 
   const challengeId = `chal-${Date.now()}-${challenger.id.slice(0, 5)}`;
@@ -667,7 +677,7 @@ export function subscribeToOutgoingChallenges(
   );
 }
 
-// Accept challenge and create a real-time simultaneous battle session (ONLY when both are online)
+// Accept challenge and create a real-time simultaneous battle session
 export async function acceptDuelChallengeAndStartBattle(
   challenge: DuelChallenge,
   currentUser: User
@@ -675,13 +685,7 @@ export async function acceptDuelChallengeAndStartBattle(
   // 1. Ensure current user presence is marked online
   await updateTrainerPresence(currentUser.id, true);
 
-  // 2. Verify challenger: Check if challenge was created recently (within last 5 minutes) or challenger is active
-  const challengeAge = Date.now() - new Date(challenge.createdAt).getTime();
-  const isChallengerOnline = await checkTrainerIsOnline(challenge.challengerId);
-  if (!isChallengerOnline && challengeAge > 300000) {
-    throw new Error(`Trainer ${challenge.challengerName} has gone offline. Both trainers must be online to play.`);
-  }
-
+  // 2. Battle session setup - always permit accepting a challenge
   const battleId = `battle-${Date.now()}-${challenge.challengerId.slice(0, 4)}-${currentUser.id.slice(0, 4)}`;
   const battlePath = `activeBattles/${battleId}`;
 
@@ -1170,7 +1174,15 @@ export async function loadUserStateFromCloud(userId: string, email?: string | nu
       }
     }
 
-    // 3. Fallback: If not found, search users collection by email
+    // 3. If still not found and auth.currentUser has a different UID, try auth.currentUser.uid
+    if (!docSnap.exists() && auth.currentUser?.uid && auth.currentUser.uid !== canonicalId && auth.currentUser.uid !== userId) {
+      const authSnap = await getDoc(doc(db, 'users', auth.currentUser.uid));
+      if (authSnap.exists()) {
+        docSnap = authSnap;
+      }
+    }
+
+    // 4. Fallback: If not found, search users collection by email
     if (!docSnap.exists() && cleanEmail) {
       const q = query(collection(db, 'users'), where('email', '==', cleanEmail));
       const querySnap = await getDocs(q);
@@ -1189,14 +1201,46 @@ export async function loadUserStateFromCloud(userId: string, email?: string | nu
       }
     }
 
+    // 5. Fallback: If not found in users, check trainerAccounts collection
+    if (!docSnap.exists() && cleanEmail) {
+      const accountId = emailToSafeAccountId(cleanEmail);
+      const accSnap = await getDoc(doc(db, 'trainerAccounts', accountId));
+      if (accSnap.exists()) {
+        const accData = accSnap.data();
+        const trainerName = accData.displayName?.trim() || cleanEmail.split('@')[0] || 'Trainer';
+        const base = createInitialState(trainerName, canonicalId);
+        return {
+          ...base,
+          user: {
+            ...base.user,
+            id: canonicalId,
+            username: trainerName,
+          },
+          hasClaimedUsername: true,
+        };
+      }
+    }
+
     if (docSnap.exists()) {
       const data = docSnap.data();
-      if (!data || !data.user) return null;
+      if (!data) return null;
+
+      const resolvedUsername = 
+        (data.user?.username && data.user.username !== 'Trainer' ? data.user.username : null) ||
+        data.displayName?.trim() ||
+        (cleanEmail ? cleanEmail.split('@')[0] : null) ||
+        'Trainer';
+
+      const base = createInitialState(resolvedUsername, canonicalId);
 
       const loadedState: GameState = {
+        ...base,
+        ...data,
         user: {
-          ...data.user,
+          ...base.user,
+          ...(data.user || {}),
           id: canonicalId,
+          username: (data.user?.username && data.user.username !== 'Trainer') ? data.user.username : resolvedUsername,
         },
         inventory: data.inventory || [],
         items: [], // hydrated by client catalog
@@ -1211,10 +1255,7 @@ export async function loadUserStateFromCloud(userId: string, email?: string | nu
           reducedMotion: false,
         },
         hasCompletedOnboarding: data.hasCompletedOnboarding ?? true,
-        hasClaimedUsername: Boolean(
-          data.hasClaimedUsername ||
-          (data.user?.username && data.user.username !== 'Trainer' && data.user.username.trim().length >= 3)
-        ),
+        hasClaimedUsername: true,
         defeatedRivalsCount: data.defeatedRivalsCount || 0,
       };
 

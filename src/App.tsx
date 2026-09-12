@@ -9,6 +9,7 @@ import {
   User,
   InventoryItem,
   Specialization,
+  DuelChallenge,
 } from './types';
 import {
   loadGameState,
@@ -36,6 +37,9 @@ import {
   updateTrainerPresence,
   subscribeToIncomingChallenges,
   subscribeToOutgoingChallenges,
+  acceptDuelChallengeAndStartBattle,
+  respondToDuelChallenge,
+  deleteDuelChallenge,
 } from './services/firebase';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { AuthModal } from './components/auth/AuthModal';
@@ -52,7 +56,8 @@ import { RewardModal, RewardPayload } from './components/rpg/RewardModal';
 import { DashboardScreen } from './components/dashboard/DashboardScreen';
 import { QuestBoardScreen } from './components/quests/QuestBoardScreen';
 import { CharacterScreen } from './components/character/CharacterScreen';
-import { ArenaScreen } from './components/arena/ArenaScreen';
+import { ArenaScreen, convertChallengeToRival } from './components/arena/ArenaScreen';
+import { DuelChallengeModal } from './components/arena/DuelChallengeModal';
 import { AchievementsScreen } from './components/achievements/AchievementsScreen';
 import { LeaderboardScreen } from './components/leaderboard/LeaderboardScreen';
 import { SettingsScreen } from './components/settings/SettingsScreen';
@@ -67,8 +72,11 @@ function LifeRpgApp() {
   const [hasClaimedUsername, setHasClaimedUsername] = useState<boolean | null>(null);
   const [checkingUsernameStatus, setCheckingUsernameStatus] = useState<boolean>(true);
 
-  // Incoming duel challenges for live arena notifications
-  const [incomingDuelChallenges, setIncomingDuelChallenges] = useState<any[]>([]);
+  // Incoming duel challenges for live arena notifications and modals
+  const [incomingDuelChallenges, setIncomingDuelChallenges] = useState<DuelChallenge[]>([]);
+  const [isChallengeModalOpen, setIsChallengeModalOpen] = useState<boolean>(false);
+  const [pendingInitialBattle, setPendingInitialBattle] = useState<{ battleId: string; rival: Rival } | null>(null);
+  const prevChallengesCountRef = useRef<number>(0);
 
   // Modals
   const [levelUpEvent, setLevelUpEvent] = useState<LevelUpEvent | null>(null);
@@ -104,7 +112,30 @@ function LifeRpgApp() {
 
     // 1. Instantly load local cache if available for fast initial rendering
     const cachedLocal = loadGameState(uid);
-    setGameState(cachedLocal);
+    const guestState = loadGameState('user_guest');
+    const storedTrainerName = typeof window !== 'undefined' ? localStorage.getItem(`liferpg_trainer_name_${uid}`) : null;
+
+    // Resolve an established trainer name from available user sources
+    const candidateUsername =
+      storedTrainerName ||
+      (cachedLocal.user?.username && cachedLocal.user.username !== 'Trainer' ? cachedLocal.user.username : null) ||
+      (guestState.user?.username && guestState.user.username !== 'Trainer' ? guestState.user.username : null) ||
+      (firebaseUser.displayName?.trim() && firebaseUser.displayName.trim() !== 'Trainer' ? firebaseUser.displayName.trim() : null) ||
+      (email ? email.split('@')[0].trim() : null) ||
+      'Trainer';
+
+    // Fast initial local display with resolved trainer name
+    const initialLocalWithResolvedName: GameState = {
+      ...cachedLocal,
+      user: {
+        ...cachedLocal.user,
+        id: uid,
+        username: (cachedLocal.user?.username && cachedLocal.user.username !== 'Trainer') ? cachedLocal.user.username : candidateUsername,
+      },
+      hasClaimedUsername: true,
+    };
+    setGameState(initialLocalWithResolvedName);
+    setHasClaimedUsername(true);
 
     // 2. Fetch authoritative cloud state (checks by UID and falls back to email)
     loadUserStateFromCloud(uid, email)
@@ -113,8 +144,13 @@ function LifeRpgApp() {
 
         if (cloudState && cloudState.user) {
           // Existing cloud account found! Hydrate state with full user data
-          const base = createInitialState('Trainer', uid);
-          const user = { ...base.user, ...cloudState.user, id: uid };
+          const finalUsername =
+            (cloudState.user?.username && cloudState.user.username !== 'Trainer')
+              ? cloudState.user.username
+              : candidateUsername;
+
+          const base = createInitialState(finalUsername, uid);
+          const user = { ...base.user, ...cloudState.user, id: uid, username: finalUsername };
 
           const { maxHp, maxStamina } = deriveMaxVitals(
             user.attributes?.end || 0,
@@ -140,6 +176,11 @@ function LifeRpgApp() {
           saveGameState(hydrated, uid);
           setHasClaimedUsername(true);
 
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(`liferpg_trainer_name_${uid}`, finalUsername);
+            localStorage.setItem(`liferpg_username_claimed_${uid}`, 'true');
+          }
+
           // Sync public trainer profile
           const completedCount = (hydrated.quests || []).filter((q) => q.status === 'COMPLETED').length;
           syncPublicTrainerProfile(
@@ -149,42 +190,38 @@ function LifeRpgApp() {
             hydrated.defeatedRivalsCount || 0
           ).catch((e) => console.warn('Public trainer sync:', e));
         } else {
-          // No cloud document exists yet: check if local state already has a claimed username
-          const hasLocalUsername = Boolean(
-            cachedLocal.user?.username &&
-            cachedLocal.user.username !== 'Trainer' &&
-            cachedLocal.user.username.trim().length >= 3
-          );
+          // No cloud document exists yet: initialize with our established candidate username and seed cloud
+          const base = createInitialState(candidateUsername, uid);
+          const stateWithUid: GameState = {
+            ...base,
+            ...cachedLocal,
+            user: {
+              ...base.user,
+              ...cachedLocal.user,
+              id: uid,
+              username: candidateUsername,
+            },
+            hasClaimedUsername: true,
+          };
 
-          if (hasLocalUsername) {
-            // Local state has an existing character; persist it to cloud now
-            const stateWithUid: GameState = {
-              ...cachedLocal,
-              user: { ...cachedLocal.user, id: uid },
-              hasClaimedUsername: true,
-            };
-            setGameState(stateWithUid);
-            saveGameState(stateWithUid, uid);
-            setHasClaimedUsername(true);
-            saveUserStateToCloud(uid, stateWithUid, email).catch((err) =>
-              console.warn('Initial cloud seed error:', err)
-            );
-          } else {
-            // Brand new account: prompt user to claim their username and create their character
-            setHasClaimedUsername(false);
+          setGameState(stateWithUid);
+          saveGameState(stateWithUid, uid);
+          setHasClaimedUsername(true);
+
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(`liferpg_trainer_name_${uid}`, candidateUsername);
+            localStorage.setItem(`liferpg_username_claimed_${uid}`, 'true');
           }
+
+          saveUserStateToCloud(uid, stateWithUid, email).catch((err) =>
+            console.warn('Initial cloud seed error:', err)
+          );
         }
       })
       .catch((err) => {
         console.warn('Failed to load cloud state:', err);
         if (!isMounted) return;
-        // In case of error, check if local state has claimed username
-        const hasLocalUsername = Boolean(
-          cachedLocal.user?.username &&
-          cachedLocal.user.username !== 'Trainer' &&
-          cachedLocal.user.username.trim().length >= 3
-        );
-        setHasClaimedUsername(hasLocalUsername);
+        setHasClaimedUsername(true);
       })
       .finally(() => {
         if (!isMounted) return;
@@ -300,6 +337,8 @@ function LifeRpgApp() {
   useEffect(() => {
     if (!firebaseUser?.uid || !hasClaimedUsername) {
       setIncomingDuelChallenges([]);
+      setIsChallengeModalOpen(false);
+      prevChallengesCountRef.current = 0;
       return;
     }
 
@@ -307,9 +346,11 @@ function LifeRpgApp() {
       firebaseUser.uid,
       (challenges) => {
         setIncomingDuelChallenges(challenges);
-        if (challenges.length > 0) {
+        if (challenges.length > prevChallengesCountRef.current) {
           chiptune.playLevelUp();
+          setIsChallengeModalOpen(true);
         }
+        prevChallengesCountRef.current = challenges.length;
       },
       (err) => {
         console.warn('App challenges listener error:', err);
@@ -318,6 +359,34 @@ function LifeRpgApp() {
 
     return () => unsub();
   }, [firebaseUser?.uid, hasClaimedUsername]);
+
+  const handleAcceptDuelChallenge = async (challenge: DuelChallenge) => {
+    chiptune.playLevelUp();
+    try {
+      const battleId = await acceptDuelChallengeAndStartBattle(challenge, gameState.user);
+      const rival = convertChallengeToRival(challenge, gameState.user.level);
+      setPendingInitialBattle({
+        battleId,
+        rival,
+      });
+      setCurrentScreen('arena');
+      setIsChallengeModalOpen(false);
+    } catch (err: any) {
+      console.error('Failed to accept duel challenge:', err);
+      throw err;
+    }
+  };
+
+  const handleDeclineDuelChallenge = async (challenge: DuelChallenge) => {
+    chiptune.playCursor();
+    try {
+      await respondToDuelChallenge(challenge.id, false);
+      setIncomingDuelChallenges((prev) => prev.filter((c) => c.id !== challenge.id));
+    } catch (err: any) {
+      console.error('Failed to decline duel challenge:', err);
+      throw err;
+    }
+  };
 
   // App-wide listener for outgoing challenges (if opponent accepts while browsing other screens, take user to Arena)
   useEffect(() => {
@@ -850,8 +919,9 @@ function LifeRpgApp() {
     return <AuthHomePage />;
   }
 
-  // 3. Authenticated: Has not yet claimed unique username across all accounts
-  if (!hasClaimedUsername) {
+  // 3. Authenticated: Only prompt if user has no assigned username whatsoever
+  const needsUsernameClaim = !hasClaimedUsername && (!gameState.user?.username || gameState.user.username === 'Trainer');
+  if (needsUsernameClaim) {
     return (
       <ClaimUsernameModal
         userId={firebaseUser.uid}
@@ -896,6 +966,17 @@ function LifeRpgApp() {
         />
       )}
 
+      {/* INCOMING DUEL CHALLENGE PROMPT MODAL */}
+      {isChallengeModalOpen && incomingDuelChallenges.length > 0 && (
+        <DuelChallengeModal
+          challenges={incomingDuelChallenges}
+          currentUser={gameState.user}
+          onAccept={handleAcceptDuelChallenge}
+          onDecline={handleDeclineDuelChallenge}
+          onClose={() => setIsChallengeModalOpen(false)}
+        />
+      )}
+
       {/* TOP STATUS BAR WITH USER AUTH & CLOUD WIDGET */}
       <TopBar
         user={gameState.user}
@@ -906,30 +987,51 @@ function LifeRpgApp() {
         onOpenAuthModal={() => setIsAuthModalOpen(true)}
       />
 
-      {/* TOP NOTIFICATION BANNER FOR LIVE DUEL CHALLENGE (WHEN OUTSIDE ARENA) */}
-      {incomingDuelChallenges.length > 0 && currentScreen !== 'arena' && (
+      {/* TOP NOTIFICATION BANNER FOR LIVE DUEL CHALLENGE */}
+      {incomingDuelChallenges.length > 0 && (
         <div className="max-w-7xl w-full mx-auto px-2 sm:px-4 pt-2">
           <div className="bg-[#fffbeb] border-4 border-[#dc2626] p-3 shadow-[4px_4px_0px_#120e1d] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 animate-pulse">
             <div className="flex items-center gap-2.5">
               <span className="w-3 h-3 rounded-full bg-[#dc2626] animate-ping shrink-0" />
               <div>
-                <div className="font-pixel text-xs sm:text-sm text-[#991b1b] font-bold">
-                  ⚔ LIVE ARENA CHALLENGE RECEIVED!
+                <div className="font-pixel text-xs sm:text-sm text-[#991b1b] font-bold flex items-center gap-2">
+                  <span>⚔ LIVE ARENA CHALLENGE RECEIVED!</span>
+                  {incomingDuelChallenges.length > 1 && (
+                    <span className="bg-[#dc2626] text-white text-[10px] px-1.5 py-0.5">
+                      +{incomingDuelChallenges.length - 1} MORE
+                    </span>
+                  )}
                 </div>
                 <div className="font-silkscreen text-[11px] text-[#7f1d1d] mt-0.5">
                   Trainer <span className="font-bold">{incomingDuelChallenges[0].challengerName}</span> (Lv.{incomingDuelChallenges[0].challengerLevel}) challenges you to an online duel!
                 </div>
               </div>
             </div>
-            <button
-              onClick={() => {
-                chiptune.playSelect();
-                setCurrentScreen('arena');
-              }}
-              className="w-full sm:w-auto font-pixel text-xs bg-[#dc2626] hover:bg-[#b91c1c] text-white px-4 py-2 border-2 border-[#7f1d1d] shadow-[2px_2px_0px_#000] shrink-0"
-            >
-              GO TO ARENA & PLAY ▶
-            </button>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
+              <button
+                onClick={() => handleAcceptDuelChallenge(incomingDuelChallenges[0])}
+                className="flex-1 sm:flex-initial font-pixel text-xs bg-[#16a34a] hover:bg-[#15803d] text-white px-3 sm:px-4 py-2 border-2 border-[#14532d] shadow-[2px_2px_0px_#000] cursor-pointer"
+              >
+                ⚔ ACCEPT & PLAY ▶
+              </button>
+              <button
+                onClick={() => handleDeclineDuelChallenge(incomingDuelChallenges[0])}
+                className="flex-1 sm:flex-initial font-pixel text-xs bg-[#1f2937] hover:bg-[#111827] text-white px-3 sm:px-4 py-2 border-2 border-[#000] shadow-[2px_2px_0px_#000] cursor-pointer"
+              >
+                ✕ DECLINE
+              </button>
+              <button
+                onClick={() => {
+                  chiptune.playSelect();
+                  setIsChallengeModalOpen(true);
+                }}
+                className="font-pixel text-xs bg-[#e5e7eb] hover:bg-[#d1d5db] text-[#1f2937] px-2.5 py-2 border-2 border-[#9ca3af] shadow-[2px_2px_0px_#000] cursor-pointer"
+                title="View Challenger Profile"
+              >
+                👁 DETAILS
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -989,6 +1091,9 @@ function LifeRpgApp() {
               onDefeat={handleBattleDefeat}
               onRun={handleBattleRun}
               onUseItemInBattle={handleUseConsumable}
+              initialBattleId={pendingInitialBattle?.battleId}
+              initialBattleRival={pendingInitialBattle?.rival}
+              onClearInitialBattle={() => setPendingInitialBattle(null)}
             />
           )}
 

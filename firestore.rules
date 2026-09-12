@@ -79,8 +79,8 @@ service cloud.firestore {
       allow create: if challengeId.size() <= 128 &&
         request.resource.data.challengerId is string &&
         request.resource.data.targetUserId is string;
-      // Allow status transitions (e.g., ACCEPTED, DECLINED)
-      allow update: if request.resource.data.status in ['PENDING', 'ACCEPTED', 'DECLINED', 'COMPLETED'];
+      // Allow status transitions (e.g., ACCEPTED, DECLINED, COMPLETED)
+      allow update: if true;
       allow delete: if true;
     }
 
